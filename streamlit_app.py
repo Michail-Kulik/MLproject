@@ -317,7 +317,7 @@ def main():
     y_hist = hist["sales"].tail(180)
 
     # Baseline
-    base = baseline_ma(hist["sales"].values, horizon=horizon, window=7)
+    base = baseline_ma(hist["sales"].values, horizon=12, window=7)
 
     # Load NN
     pack = load_nn_for_sku_cached(sku)
