@@ -1,0 +1,214 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import timedelta
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import joblib
+
+# ==========================
+# Конфигурация
+# ==========================
+DATA_PATH = Path("sales.csv")                     # сгенерированный файл с продажами
+MODEL_DIR = Path("artifacts/sku_01")              # папка с моделью и scaler'ом
+LOOKBACK = 28                                      # должно совпадать с обучением
+HORIZON = 14                                       # должно совпадать с обучением
+
+# ==========================
+# Определение модели LSTM (должно совпадать с обученной)
+# ==========================
+class LSTMPredictor(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=2, horizon=14):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True,
+            dropout=0.2 if num_layers > 1 else 0
+        )
+        self.linear = nn.Linear(hidden_size, horizon)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)          # (batch, seq_len, hidden)
+        out = out[:, -1, :]             # последний шаг
+        out = self.linear(out)          # (batch, horizon)
+        return out
+
+# ==========================
+# Загрузка модели и скейлера (кешируем)
+# ==========================
+@st.cache_resource
+def load_model_and_scaler():
+    model_path = MODEL_DIR / "model.pt"
+    scaler_path = MODEL_DIR / "scaler.joblib"
+
+    if not model_path.exists() or not scaler_path.exists():
+        st.error(f"Модель или скейлер не найдены в {MODEL_DIR}. Сначала выполните train_univariate.py")
+        st.stop()
+
+    # Загружаем чекпоинт
+    ckpt = torch.load(model_path, map_location='cpu')
+    hidden = ckpt.get('hidden_size', 64)
+    layers = ckpt.get('num_layers', 2)
+    horizon_ckpt = ckpt.get('horizon', HORIZON)
+    lookback_ckpt = ckpt.get('lookback', LOOKBACK)
+
+    # Создаём модель с теми же параметрами
+    model = LSTMPredictor(
+        input_size=1,
+        hidden_size=hidden,
+        num_layers=layers,
+        horizon=horizon_ckpt
+    )
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+
+    # Загружаем скейлер
+    scaler = joblib.load(scaler_path)
+
+    return model, scaler, lookback_ckpt, horizon_ckpt
+
+# ==========================
+# Baseline (скользящее среднее)
+# ==========================
+def baseline_ma(history, horizon, window=7):
+    hist = list(history)
+    preds = []
+    for _ in range(horizon):
+        w = hist[-window:] if len(hist) >= window else hist
+        p = float(np.mean(w))
+        preds.append(p)
+        hist.append(p)          # для многошагового прогноза
+    return np.array(preds)
+
+# ==========================
+# Прогноз LSTM с нормализацией
+# ==========================
+def lstm_forecast(model, scaler, history, lookback, horizon):
+    """
+    history: массив последних значений продаж (длина >= lookback)
+    """
+    # Берём последние lookback значений
+    last_values = history[-lookback:].reshape(-1, 1)
+    # Масштабируем
+    scaled = scaler.transform(last_values).flatten()
+    # Формируем вход (1, lookback, 1)
+    input_tensor = torch.tensor(scaled, dtype=torch.float32).view(1, lookback, 1)
+    with torch.no_grad():
+        pred_scaled = model(input_tensor).numpy().flatten()
+    # Обратное масштабирование
+    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+    return pred
+
+# ==========================
+# Загрузка данных
+# ==========================
+@st.cache_data
+def load_data():
+    if not DATA_PATH.exists():
+        st.error(f"Файл {DATA_PATH} не найден. Сначала сгенерируйте данные через generate_sales.py")
+        st.stop()
+    df = pd.read_csv(DATA_PATH, parse_dates=['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+    return df
+
+# ==========================
+# Основное приложение
+# ==========================
+def main():
+    st.set_page_config(page_title="Univariate LSTM Forecast", layout="wide")
+    st.title("📈 Прогноз продаж (LSTM с нормализацией)")
+
+    # Загрузка данных
+    df = load_data()
+    sales = df['sales'].values
+    dates = df['date'].values
+
+    # Загрузка модели и скейлера
+    model, scaler, lookback_ckpt, horizon_ckpt = load_model_and_scaler()
+
+    # Боковая панель
+    with st.sidebar:
+        st.header("⚙️ Параметры прогноза")
+        horizon = st.slider("Горизонт (дней)", min_value=1, max_value=horizon_ckpt, value=horizon_ckpt)
+        st.info(f"Модель обучена: lookback = {lookback_ckpt} дней, максимальный горизонт = {horizon_ckpt} дней")
+
+        run = st.button("🚀 Рассчитать прогноз", use_container_width=True)
+
+    # Основная область
+    if run:
+        # Проверка, хватает ли истории
+        if len(sales) < lookback_ckpt:
+            st.error(f"Недостаточно данных: нужно минимум {lookback_ckpt} дней истории")
+            return
+
+        # Прогноз LSTM
+        lstm_pred = lstm_forecast(model, scaler, sales, lookback_ckpt, horizon)
+
+        # Прогноз baseline
+        base_pred = baseline_ma(sales, horizon, window=7)
+
+        # Даты прогноза
+        last_date = pd.to_datetime(dates[-1])
+        fut_dates = [last_date + timedelta(days=i+1) for i in range(horizon)]
+
+        # График
+        st.subheader("📊 Визуализация")
+        fig, ax = plt.subplots(figsize=(14, 5))
+        # Последние 180 дней истории для контекста
+        hist_dates = dates[-180:]
+        hist_vals = sales[-180:]
+        ax.plot(hist_dates, hist_vals, 'b-', linewidth=2, label='История продаж')
+
+        ax.plot(fut_dates, base_pred, 'r--', marker='o', label=f'Baseline MA(7)')
+        ax.plot(fut_dates, lstm_pred, 'm--', marker='s', label='LSTM прогноз')
+
+        ax.set_xlabel('Дата')
+        ax.set_ylabel('Продажи')
+        ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.7)
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+
+        # Таблица прогнозов
+        st.subheader("📋 Прогнозные значения")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Baseline MA(7)**")
+            df_base = pd.DataFrame({'date': fut_dates, 'sales_pred': base_pred.round(0)})
+            st.dataframe(df_base, use_container_width=True)
+        with col2:
+            st.write("**LSTM**")
+            df_lstm = pd.DataFrame({'date': fut_dates, 'sales_pred': lstm_pred.round(0)})
+            st.dataframe(df_lstm, use_container_width=True)
+
+        # Скачивание CSV
+        out_df = pd.DataFrame({
+            'date': fut_dates,
+            'baseline': base_pred.round(0),
+            'lstm': lstm_pred.round(0)
+        })
+        csv = out_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="💾 Скачать прогноз (CSV)",
+            data=csv,
+            file_name='forecast.csv',
+            mime='text/csv',
+            use_container_width=True
+        )
+    else:
+        st.info("👈 Нажмите «Рассчитать прогноз» в боковой панели, чтобы увидеть результат.")
+
+    # Информация о модели
+    with st.expander("ℹ️ О модели"):
+        st.markdown(f"""
+        - **Архитектура**: LSTM с {lookback_ckpt} шагами истории, {horizon_ckpt} шагами прогноза.
+        - **Данные**: синтетический временной ряд продаж (один товар).
+        - **Нормализация**: StandardScaler (Z-score) применяется к входу, выход затем восстанавливается.
+        - **Baseline**: простое скользящее среднее с окном 7 дней.
+        """)
+
+if __name__ == '__main__':
+    main()
